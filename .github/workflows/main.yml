@@ -1,0 +1,113 @@
+name: Windows Remote Desktop — 8 vCPU / 32 GB RAM
+
+on:
+  workflow_dispatch:
+    inputs:
+      rdp_user:
+        description: 'RDP username'
+        required: false
+        default: 'ratman'
+      keep_alive_minutes:
+        description: 'Minutes to keep session alive (max 350)'
+        required: false
+        default: '350'
+
+jobs:
+  remote-desktop:
+    # Larger runner: 8 vCPU, 32 GB RAM, 300 GB SSD — SEM GPU
+    # Requer GitHub Team ou Enterprise Cloud [citation:19][citation:20]
+    runs-on: windows-latest-8-cores
+    
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup RDP User
+        shell: powershell
+        env:
+          RDP_USER: ${{ github.event.inputs.rdp_user }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $User = if ([string]::IsNullOrWhiteSpace($env:RDP_USER)) { "ratman" } else { $env:RDP_USER }
+
+          Add-Type -AssemblyName System.Web
+          $Password = [System.Web.Security.Membership]::GeneratePassword(20, 4)
+
+          $SecurePass = ConvertTo-SecureString $Password -AsPlainText -Force
+          if (Get-LocalUser -Name $User -ErrorAction SilentlyContinue) {
+              Set-LocalUser -Name $User -Password $SecurePass
+          } else {
+              New-LocalUser -Name $User -Password $SecurePass -FullName $User -PasswordNeverExpires
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member $User -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $User -ErrorAction SilentlyContinue
+
+          "RDP_PASSWORD=$Password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_USERNAME=$User" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "::add-mask::$Password"
+
+      - name: Enable RDP + NLA
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service TermService
+
+      - name: Install Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          version: latest
+          args: --hostname=gh-rdp-${{ github.run_id }}
+
+      - name: Get Tailscale IP + Firewall
+        shell: powershell
+        run: |
+          $tsIP = (tailscale ip -4).Trim()
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" `
+            -Direction Inbound -Protocol TCP -LocalPort 3389 `
+            -InterfaceAlias "Tailscale" -Action Allow -ErrorAction SilentlyContinue
+          
+          Get-NetFirewallRule -DisplayName "Remote Desktop*" -ErrorAction SilentlyContinue | Disable-NetFirewallRule
+
+      - name: Hardware Report (Real)
+        shell: powershell
+        run: |
+          Write-Host "===== CPU ====="
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed | Format-List
+          
+          Write-Host "===== RAM ====="
+          "{0} GB" -f [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)
+          
+          Write-Host "===== GPU ====="
+          $gpu = Get-CimInstance Win32_VideoController
+          if ($gpu) { $gpu | Select-Object Name, DriverVersion, AdapterRAM | Format-List }
+          else { Write-Host "NO GPU — software rendering only" }
+          
+          Write-Host "===== DISK ====="
+          Get-PSDrive C | Select-Object Used, Free
+
+      - name: Connection Info
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "  RDP: $env:TAILSCALE_IP"
+          Write-Host "  USER: $env:RDP_USERNAME"
+          Write-Host "  PASS: $env:RDP_PASSWORD"
+          Write-Host "=========================================="
+          Write-Host "  mstsc /v:$env:TAILSCALE_IP"
+          Write-Host ""
+
+      - name: Keep Alive
+        shell: powershell
+        run: |
+          $min = [int]"${{ github.event.inputs.keep_alive_minutes }}"
+          if ($min -gt 350) { $min = 350 }
+          Start-Sleep -Seconds ($min * 60)
